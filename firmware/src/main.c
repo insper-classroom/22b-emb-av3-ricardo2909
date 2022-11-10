@@ -5,9 +5,28 @@
 #include "gfx_mono_text.h"
 #include "sysfont.h"
 
+
+#define PIO_PWM_RED PIOD
+#define ID_PIO_PWM_RED ID_PIOD
+#define MASK_PIN_PWM_RED (1 << 11)
+
+#define PIO_PWM_GREEN PIOA
+#define ID_PIO_PWM_GREEN ID_PIOA
+#define MASK_PIN_PWM_GREEN (1 << 2)
+
+#define PIO_PWM_BLUE PIOC
+#define ID_PIO_PWM_BLUE ID_PIOC
+#define MASK_PIN_PWM_BLUE (1 << 19)
+
+#define AFEC_POT AFEC0
+#define AFEC_POT_ID ID_AFEC0
+#define AFEC_POT_CHANNEL 0
+
 /** RTOS  */
 #define TASK_OLED_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
 #define TASK_OLED_STACK_PRIORITY            (tskIDLE_PRIORITY)
+
+
 
 extern void vApplicationStackOverflowHook(xTaskHandle *pxTask,  signed char *pcTaskName);
 extern void vApplicationIdleHook(void);
@@ -24,6 +43,18 @@ void wheel( uint WheelPos, uint *r, uint *g, uint *b );
 /************************************************************************/
 /* RTOS application funcs                                               */
 /************************************************************************/
+
+QueueHandle_t xQueueAFEC;
+QueueHandle_t xQueueRGB;
+SemaphoreHandle_t xSemaphore;
+
+typedef struct {
+	uint R;
+	uint G;
+	uint B;
+} adcData;
+
+
 extern void vApplicationStackOverflowHook(xTaskHandle *pxTask, signed char *pcTaskName) {
 	printf("stack overflow %x %s\r\n", pxTask, (portCHAR *)pcTaskName);
 	for (;;) {	}
@@ -41,15 +72,87 @@ extern void vApplicationMallocFailedHook(void) {
 /* handlers / callbacks                                                 */
 /************************************************************************/
 
+static void AFEC_pot_callback(void) {
+	int valor;
+	valor = afec_channel_get_value(AFEC_POT, AFEC_POT_CHANNEL);
+	BaseType_t xHigherPriorityTaskWoken = pdTRUE;
+	xQueueSendFromISR(xQueueAFEC, &valor, 0);
+}
+
+void RTT_Handler(void) {
+	uint32_t ul_status;
+	ul_status = rtt_get_status(RTT);
+
+	/* IRQ due to Alarm */
+	if ((ul_status & RTT_SR_ALMS) == RTT_SR_ALMS) {
+		RTT_init(1000, 10, RTT_MR_ALMIEN);
+		afec_channel_enable(AFEC_POT, AFEC_POT_CHANNEL);
+		afec_start_software_conversion(AFEC_POT);
+	}
+}
 /************************************************************************/
 /* TASKS                                                                */
 /************************************************************************/
 
 static void task_led(void *pvParameters) {
-
+	adcData RGB;
+	pmc_enable_periph_clk(ID_PIO_PWM_RED);
+	pio_set_peripheral(PIO_PWM_RED, PIO_PERIPH_B, MASK_PIN_PWM_RED );
+	static pwm_channel_t pwm_channel_pin_RED;
+	PWM_init(PWM0, ID_PWM0,  &pwm_channel_pin_RED, PWM_CHANNEL_0, 0);
+	
+	pmc_enable_periph_clk(ID_PIO_PWM_GREEN);
+	pio_set_peripheral(PIO_PWM_GREEN, PIO_PERIPH_A, MASK_PIN_PWM_GREEN );
+	static pwm_channel_t pwm_channel_pin_GREEN;
+	PWM_init(PWM0, ID_PWM0,  &pwm_channel_pin_GREEN, PWM_CHANNEL_1, 0);
+	
+	pmc_enable_periph_clk(ID_PIO_PWM_BLUE);
+	pio_set_peripheral(PIO_PWM_BLUE, PIO_PERIPH_B, MASK_PIN_PWM_BLUE );
+	static pwm_channel_t pwm_channel_pin_BLUE;
+	PWM_init(PWM0, ID_PWM0,  &pwm_channel_pin_BLUE, PWM_CHANNEL_2, 0);
+	
+	int duty =0;
 	while (1) {
+		if(xQueueReceive(xQueueRGB, &(RGB), 1000)){
+			printf("%d\n", RGB.R);
+			printf("%d\n", RGB.G);
+			printf("%d\n", RGB.B);
+			pwm_channel_update_duty(PWM0, &pwm_channel_pin_RED, RGB.R);
+			pwm_channel_update_duty(PWM0, &pwm_channel_pin_GREEN, RGB.G);
+			pwm_channel_update_duty(PWM0, &pwm_channel_pin_BLUE, RGB.B);
+		}
+			
+// 		}
+// 		for(duty = 0; duty <= 255; duty++){
+// 			pwm_channel_update_duty(PWM0, &pwm_channel_pin_RED, 255-duty);
+// 			delay_ms(10);
+// 		}
+// 		/* fade out*/
+// 		for(duty = 0; duty <= 255; duty++){
+// 			pwm_channel_update_duty(PWM0, &pwm_channel_pin_BLUE, duty);
+// 			delay_ms(10);
+// 		}
 
 	}
+}
+
+static void task_afec(void *pvParameters){
+	adcData color;
+	config_AFEC_pot(AFEC_POT, AFEC_POT_ID, AFEC_POT_CHANNEL, AFEC_pot_callback);
+	int valor;
+	while (1){
+		RTT_init(1000, 10, RTT_MR_ALMIEN);
+		if(xQueueReceive(xQueueAFEC, &valor, 500)){
+				/*printf("%d\n", valor);*/
+				wheel(valor, &color.R, &color.G, &color.B);
+// 				printf("%d\n", R);
+// 				printf("%d\n", G);
+// 				printf("%d\n", B);
+				xQueueSend(xQueueRGB, &(color), 0);
+			}
+			
+	}
+		
 }
 
 /************************************************************************/
@@ -57,7 +160,23 @@ static void task_led(void *pvParameters) {
 /************************************************************************/
 
 void wheel( uint WheelPos, uint *r, uint *g, uint *b ) {
-
+	WheelPos = (255*WheelPos)/4095;
+	
+	if ( WheelPos < 85 ) {
+		*r = 255- WheelPos *3;
+		*g = 0;
+		*b = WheelPos*3;
+		} else if( WheelPos < 170 ) {
+		WheelPos -= 85;
+		*r = 0;
+		*g = WheelPos *3;
+		*b = 255 - WheelPos*3;
+		} else {
+		WheelPos -= 170;
+		*r = WheelPos*3;
+		*g = 255 - WheelPos*3;
+		*b = 0;
+	}
 }
 
 static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel,
@@ -193,6 +312,11 @@ int main(void) {
 	/* Initialize the SAM system */
 	sysclk_init();
 	board_init();
+	
+	
+	
+	
+	
 
 	/* Initialize the console uart */
 	configure_console();
@@ -202,6 +326,15 @@ int main(void) {
 	TASK_OLED_STACK_PRIORITY, NULL) != pdPASS) {
 		printf("Failed to create task_led\r\n");
 	}
+	
+	if (xTaskCreate(task_afec, "afec", TASK_OLED_STACK_SIZE, NULL,
+	TASK_OLED_STACK_PRIORITY, NULL) != pdPASS) {
+		printf("Failed to create task_afec\r\n");
+	}
+	
+	xQueueAFEC = xQueueCreate(32, sizeof(int));
+	xQueueRGB = xQueueCreate(100, sizeof(adcData));
+	xSemaphore = xSemaphoreCreateBinary();
 
 	/* Start the scheduler. */
 	vTaskStartScheduler();
